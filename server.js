@@ -133,9 +133,10 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, { imported: fresh.length, skipped: imported.length - fresh.length, total: imported.length });
     }
     if (url.pathname.startsWith('/api/')) return send(res, 404, { error: 'API route not found.' });
-    const safePath = path.normalize(decodeURIComponent(url.pathname)).replace(/^([.][.][/\\])+/, '');
-    const file = path.join(PUBLIC, safePath === '/' ? 'index.html' : safePath);
-    if (!file.startsWith(PUBLIC + path.sep) && file !== path.join(PUBLIC, 'index.html')) return send(res, 403, 'Forbidden', 'text/plain');
+    const requestPath = decodeURIComponent(url.pathname);
+    const relativePath = requestPath === '/' ? 'index.html' : requestPath.replace(/^[/\\]+/, '');
+    const file = path.resolve(PUBLIC, relativePath);
+    if (file !== PUBLIC && !file.startsWith(PUBLIC + path.sep)) return send(res, 403, 'Forbidden', 'text/plain');
     if (!fs.existsSync(file) || !fs.statSync(file).isFile()) return send(res, 404, 'Not found', 'text/plain; charset=utf-8');
     const types = { '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.svg': 'image/svg+xml' };
     send(res, 200, fs.readFileSync(file), types[path.extname(file)] || 'application/octet-stream');
