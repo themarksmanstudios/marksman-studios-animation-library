@@ -41,16 +41,24 @@ function normalize(row) {
   const title = text(pick('title', 'animation', 'name', 'animationname'), 160);
   if (!title) return null;
   const statuses = ['Planning', 'In Progress', 'Review', 'Approved', 'Archived'];
-  const statusText = text(pick('status', 'stage'), 40).toLowerCase();
-  const status = statuses.find(s => s.toLowerCase() === statusText) || 'Planning';
+  const statusText = text(pick('status', 'stage', 'productionstatus'), 40).toLowerCase();
+  const status = statusText === 'planned' ? 'Planning' : statuses.find(s => s.toLowerCase() === statusText) || 'Planning';
+  const details = [
+    ['Collection', pick('collection')],
+    ['Subcategory', pick('subcategory')],
+    ['Region / scope', pick('regionscope', 'region')],
+    ['Profile hashtags', pick('profilehashtags')],
+    ['Capture notes', pick('capturenotes')]
+  ].filter(([, value]) => value).map(([label, value]) => `${label}: ${value}`);
+  const description = [text(pick('description', 'notes', 'brief', 'summary'), 1200), ...details].filter(Boolean).join('\n');
   return {
-    id: text(pick('id'), 80) || crypto.randomUUID(), title,
+    id: text(pick('id', 'animationid', 'sourceid'), 80) || crypto.randomUUID(), title,
     category: text(pick('category', 'type', 'department'), 100),
     status, owner: text(pick('owner', 'artist', 'assignee', 'lead'), 100),
     priority: ['Low', 'Normal', 'High', 'Urgent'].find(p => p.toLowerCase() === text(pick('priority'), 30).toLowerCase()) || 'Normal',
     dueDate: text(pick('duedate', 'deadline', 'targetdate'), 20),
-    description: text(pick('description', 'notes', 'brief', 'summary'), 1200),
-    tags: text(pick('tags', 'keywords'), 200), updatedAt: new Date().toISOString()
+    description: text(description, 1200),
+    tags: text(pick('tags', 'keywords', 'searchtags'), 200), updatedAt: new Date().toISOString()
   };
 }
 function parseXlsx(buffer, filename) {
@@ -127,8 +135,10 @@ const server = http.createServer(async (req, res) => {
       else rows = parseCsv(data);
       const imported = rows.map(normalize).filter(Boolean);
       if (!imported.length) return send(res, 400, { error: 'No animation rows with a title were found. Check the first row for a Title or Animation column.' });
-      const existing = readItems(); const keys = new Set(existing.map(x => x.title.toLowerCase()));
-      const fresh = imported.filter(item => !keys.has(item.title.toLowerCase()));
+      const existing = readItems();
+      const usesCatalogIds = imported.some(item => /^[A-Z]+-\d+$/.test(item.id));
+      const keys = new Set(existing.map(item => usesCatalogIds ? item.id : item.title.toLowerCase()));
+      const fresh = imported.filter(item => !keys.has(usesCatalogIds ? item.id : item.title.toLowerCase()));
       writeItems([...fresh, ...existing]);
       return send(res, 200, { imported: fresh.length, skipped: imported.length - fresh.length, total: imported.length });
     }

@@ -14,7 +14,9 @@ Open <http://127.0.0.1:4173>. Records are stored in `data/animations.json` on th
 
 ## Catalogue import
 
-Use **Import catalogue** to import `.xlsx`, `.xls` (Excel XML/legacy files are not supported; use `.xlsx`), `.csv`, or `.json`. The Excel reader handles the first worksheet. Include a header row; `Title` or `Animation` is required. Optional recognized columns include Category, Status, Owner/Artist, Priority, Due Date/Deadline, Description/Brief/Notes and Tags. Existing titles are skipped (case-insensitive).
+Use **Import catalogue** to import `.xlsx`, `.xls` (Excel XML/legacy files are not supported; use `.xlsx`), `.csv`, or `.json`. The Excel reader finds the header row in the first worksheet. `Title`, `Animation`, or `Animation name` is required. Recognized catalogue fields include Animation ID, Category, Subcategory, Collection, Region / scope, Search tags, Profile hashtags, Production status and Capture notes. Other supported fields include Owner/Artist, Priority, Due Date/Deadline and Description/Brief/Notes. Reimports of catalogues with stable animation IDs skip records already present.
+
+Animation records are saved in `data/animations.json` and are excluded from Git, so local catalogue data stays on this device when the source code is pushed.
 
 The source workbook `Marksman_Animation_Catalogue.xlsx` was not present in the inspected project or nearby shared animation-library folder. Import it from the dashboard when it becomes available.
 

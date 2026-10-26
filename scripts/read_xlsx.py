@@ -1,5 +1,6 @@
 """Read the first worksheet of an XLSX file using Python's standard library."""
 import json
+import re
 import sys
 import zipfile
 import xml.etree.ElementTree as ET
@@ -47,9 +48,17 @@ def main(filename):
                 values[idx] = raw
             rows.append(values)
         if not rows: print('[]'); return
-        headers = [str(v).strip() for v in rows[0]]
+        header_index = next((i for i, row in enumerate(rows)
+                             if {'animationid', 'animationname'}.issubset(
+                                 {re.sub(r'[^a-z0-9]', '', str(value).lower()) for value in row if value})), None)
+        if header_index is None:
+            header_index = next((i for i, row in enumerate(rows)
+                                 if any(str(value).strip().lower() in ('title', 'animation', 'animation name', 'name')
+                                        for value in row if value)), None)
+        if header_index is None: print('[]'); return
+        headers = [str(v).strip() for v in rows[header_index]]
         result = [{header: (row[i] if i < len(row) else '') for i, header in enumerate(headers) if header}
-                  for row in rows[1:] if any(str(v).strip() for v in row)]
+                  for row in rows[header_index + 1:] if any(str(v).strip() for v in row)]
         print(json.dumps(result, ensure_ascii=False))
 
 if __name__ == '__main__':
