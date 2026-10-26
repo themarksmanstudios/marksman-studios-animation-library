@@ -1,0 +1,13 @@
+{
+  "name": "marksman-animation-library",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Internal animation production library and tracking dashboard for Marksman Studios.",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
