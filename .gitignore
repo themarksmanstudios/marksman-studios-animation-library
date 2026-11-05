@@ -1,7 +1,16 @@
 node_modules/
 __pycache__/
 data/*.json
+data/*.tmp
 data/import-*.xlsx
+!data/animation-catalogue.csv
+data/references/
+data/production/
 .env
 .env.*
 *.log
+.next/
+out/
+coverage/
+*.tsbuildinfo
+!.env.example
