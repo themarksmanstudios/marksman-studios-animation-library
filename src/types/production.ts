@@ -1,4 +1,5 @@
 export type BlenderJobStatus = 'prepared' | 'queued' | 'running' | 'complete' | 'partial' | 'failed';
+export type ProductionAction = 'glb' | 'gif' | 'fbx';
 
 export interface ProductionProject {
   animationId: string;
@@ -11,4 +12,8 @@ export interface ProductionProject {
   outputs?: string[];
   sourceFiles?: Array<{ role: string; path: string }>;
   missingInputs?: string[];
+  gifResolution?: { width: number; height: number };
+  completedActions?: ProductionAction[];
+  currentAction?: ProductionAction | null;
+  lastFailedAction?: ProductionAction | null;
 }

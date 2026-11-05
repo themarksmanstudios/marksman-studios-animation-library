@@ -4,7 +4,7 @@ import { useEffect, useRef, useState } from 'react';
 import Image from 'next/image';
 import type { Animation, AnimationReference } from '@/types/animation';
 import type { ProductionProject } from '@/types/production';
-import { X, BookmarkSimple, FolderPlus, Play, ArrowRight, Images, Video, ArrowSquareOut, LinkSimple, FilmSlate, Plus, UploadSimple } from '@phosphor-icons/react';
+import { X, BookmarkSimple, FolderPlus, ArrowRight, Images, Video, ArrowSquareOut, LinkSimple, FilmSlate, FileArrowDown, Cube, Plus, UploadSimple } from '@phosphor-icons/react';
 
 interface Props {
   item: Animation;
@@ -23,12 +23,16 @@ export function AnimationDetail({ item, saved, onClose, onSave, onEdit, onRefres
   const [title, setTitle] = useState('');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
+  const [gifWidth, setGifWidth] = useState(480);
+  const [gifHeight, setGifHeight] = useState(480);
   const [production, setProduction] = useState<ProductionProject | null>(null);
   const fileInput = useRef<HTMLInputElement>(null);
   const query = safeImageQuery(`${item.title} ${item.region}`);
-  const completedGif = production && ['complete', 'partial'].includes(production.status) && production.outputs?.some(output => output.toLowerCase().endsWith('.glb'))
+  const completedGif = production?.completedActions?.includes('gif')
     ? production.outputs?.find(output => output.toLowerCase().endsWith('.gif'))
     : undefined;
+  const completedActions = new Set(production?.completedActions || []);
+  const jobRunning = !!production && ['queued', 'running'].includes(production.status);
 
   useEffect(() => {
     if (tab === 'preview' && !completedGif) setTab('overview');
@@ -39,7 +43,11 @@ export function AnimationDetail({ item, saved, onClose, onSave, onEdit, onRefres
     const refreshProduction = async () => {
       try {
         const response = await fetch(`/api/animations/${encodeURIComponent(item.id)}/production`, { cache: 'no-store' });
-        if (response.ok && alive) setProduction(await response.json());
+        if (response.ok && alive) {
+          const value = await response.json() as ProductionProject;
+          setProduction(value);
+          if (value.gifResolution) { setGifWidth(value.gifResolution.width); setGifHeight(value.gifResolution.height); }
+        }
       } catch { /* Production workspace is optional until first prepared. */ }
     };
     void refreshProduction();
@@ -57,10 +65,14 @@ export function AnimationDetail({ item, saved, onClose, onSave, onEdit, onRefres
     return () => window.clearInterval(timer);
   }, [item.id, production]);
 
-  async function productionAction(action: 'prepare' | 'run') {
+  async function productionAction(action: 'prepare' | 'gif' | 'glb' | 'fbx') {
     setBusy(true); setError('');
     try {
-      const response = await fetch(`/api/animations/${encodeURIComponent(item.id)}/production${action === 'run' ? '/run' : ''}`, { method: 'POST' });
+      const isProcess = action !== 'prepare';
+      const response = await fetch(`/api/animations/${encodeURIComponent(item.id)}/production${isProcess ? '/run' : ''}`, {
+        method: 'POST',
+        ...(isProcess ? { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action, ...(action === 'gif' ? { width: gifWidth, height: gifHeight } : {}) }) } : {}),
+      });
       const result = await response.json();
       if (!response.ok) throw new Error(result.error || 'The Blender production action failed.');
       setProduction(result);
@@ -124,20 +136,29 @@ export function AnimationDetail({ item, saved, onClose, onSave, onEdit, onRefres
         {item.description && <div className="detail-field"><div className="detail-field-label">Production brief</div><p className="capture-notes">{item.description}</p></div>}
         <section className="production-panel" aria-label="Blender production workspace">
           <div className="detail-field-label">Blender production</div>
-          <p>Use the uploaded Blender scene and its character for the GIF and GLB. If the scene has no animation action, put this animation's captured motion file in 02-motion-source; Blender will retarget it onto the scene character.</p>
+          <p>Complete the playback GLB first, then render the GIF, then export the head-removed source FBXs. Each next step unlocks only after its previous output succeeds.</p>
           {!production ? <button className="button secondary" disabled={busy} onClick={() => void productionAction('prepare')}><FolderPlus size={15} /> Generate folder structure</button> : <>
             <div className="production-status"><span className={`status-dot ${production.status}`} /> {production.status}</div>
             <code className="production-path">{production.directory}</code>
             {production.sourceFiles?.length ? <details className="production-source-list"><summary>Blender input sources ({production.sourceFiles.length})</summary><ul>{production.sourceFiles.map(source => <li key={`${source.role}:${source.path}`}><strong>{source.role}</strong><code>{source.path}</code></li>)}</ul></details> : null}
             <div className="production-actions">
-              <button className="button secondary" disabled={busy || ['queued', 'running'].includes(production.status)} onClick={() => void productionAction('run')}><Play size={15} /> Prepare Blender job</button>
-              <button className="button secondary" disabled={busy} onClick={() => void productionAction('prepare')}>Refresh folder structure</button>
+              <button className={`button secondary production-process-button${production.currentAction === 'glb' ? ' is-running' : ''}`} disabled={busy || jobRunning} aria-busy={production.currentAction === 'glb'} onClick={() => void productionAction('glb')}><span className="process-progress" aria-hidden="true" />{production.currentAction === 'glb' ? 'Creating playback GLB…' : <><Cube size={15} /> {completedActions.has('glb') ? 'Recreate playback GLB' : 'Create playback GLB'}</>}</button>
+              <div className="gif-resolution-controls" aria-label="GIF resolution">
+                <span>GIF resolution</span>
+                <label>W<input type="number" min={120} max={1920} step={1} disabled={!completedActions.has('glb') || jobRunning} value={gifWidth} onChange={event => setGifWidth(Number(event.target.value))} aria-label="GIF width in pixels" /></label>
+                <span>×</span>
+                <label>H<input type="number" min={120} max={1920} step={1} disabled={!completedActions.has('glb') || jobRunning} value={gifHeight} onChange={event => setGifHeight(Number(event.target.value))} aria-label="GIF height in pixels" /></label>
+                <span>px</span>
+              </div>
+              <button className={`button secondary production-process-button${production.currentAction === 'gif' ? ' is-running' : ''}`} disabled={busy || jobRunning || !completedActions.has('glb') || gifWidth < 120 || gifHeight < 120 || gifWidth > 1920 || gifHeight > 1920} aria-busy={production.currentAction === 'gif'} onClick={() => void productionAction('gif')}><span className="process-progress" aria-hidden="true" />{production.currentAction === 'gif' ? 'Creating GIF…' : <><FilmSlate size={15} /> {completedActions.has('gif') ? 'Recreate GIF' : 'Create GIF'}</>}</button>
+              <button className={`button secondary production-process-button${production.currentAction === 'fbx' ? ' is-running' : ''}`} disabled={busy || jobRunning || !completedActions.has('glb') || !completedActions.has('gif')} aria-busy={production.currentAction === 'fbx'} onClick={() => void productionAction('fbx')}><span className="process-progress" aria-hidden="true" />{production.currentAction === 'fbx' ? 'Creating head-removed FBXs…' : <><FileArrowDown size={15} /> {completedActions.has('fbx') ? 'Recreate head-removed FBXs' : 'Create head-removed FBXs'}</>}</button>
+              <button className="button secondary" disabled={busy || jobRunning} onClick={() => void productionAction('prepare')}>Refresh folder structure</button>
             </div>
             {production.outputs?.length ? <ul className="production-outputs">{production.outputs.map(output => <li key={output}><a href={assetUrl(production, output)}>{output.split(/[\\/]/).pop()}</a></li>)}</ul> : null}
             {production.missingInputs?.length ? <p className="production-hint">Still needed: {production.missingInputs.join(', ')}</p> : null}
             {production.lastError ? <p className="form-error">{production.lastError}</p> : null}
           </>}
-          <small>Place each Unreal, Mixamo, or generalized rig's animated file in its matching input folder. Blender uses the shared Mixamo bone map configured from Add bone names on the dashboard and exports a GLB with baked motion.</small>
+          <small>Choose a GIF size in pixels; the encoder reduces palette colors toward a 5 MB target while preserving those dimensions when possible. Head-removed FBX export keeps the original animation and skeleton and leaves input files untouched. Only the approved scene character gets a playback GLB.</small>
         </section>
         {completedGif && production && <section className="inline-animation-preview" aria-label="Completed animation preview">
           <div className="detail-field-label"><span>Animation preview</span><button onClick={() => setTab('preview')}>Open preview tab <ArrowRight size={14} /></button></div>

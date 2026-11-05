@@ -24,33 +24,48 @@ async function main() {
 
   const metadata = await sharp(frames[0]).metadata();
   if (!metadata.width || !metadata.height) throw new Error('Could not read PNG frame dimensions.');
-  const temporaryPath = `${outputPath}.tmp.gif`;
+  const targetBytes = Number(process.argv[7] || 5 * 1024 * 1024);
+  if (!Number.isFinite(targetBytes) || targetBytes < 1) throw new Error('GIF target size must be positive bytes.');
   const inputs = await Promise.all(frames.map(file => sharp(file).png().toBuffer()));
-  await sharp({
-    create: {
-      width: metadata.width,
-      height: metadata.height * frames.length,
-      channels: 4,
-      background: { r: 0, g: 0, b: 0, alpha: 0 },
-      pageHeight: metadata.height,
-    },
-  }).composite(inputs.map((input, index) => ({ input, left: 0, top: metadata.height * index })))
-    .gif({ loop: 0, delay: delays, effort: 5, colours: 192 })
-    .toFile(temporaryPath);
-
-  const encoded = await sharp(temporaryPath).metadata();
-  if (encoded.pages !== frames.length || encoded.delay?.length !== frames.length) {
-    fs.rmSync(temporaryPath, { force: true });
-    throw new Error(`GIF encoding incomplete: expected ${frames.length} pages, found ${encoded.pages || 0}.`);
-  }
-  const encodedDuration = encoded.delay.reduce((sum, delay) => sum + delay, 0);
-  if (encodedDuration !== durationCs * 10) {
-    fs.rmSync(temporaryPath, { force: true });
-    throw new Error(`GIF duration mismatch: expected ${durationCs * 10} ms, encoded ${encodedDuration} ms.`);
-  }
   fs.mkdirSync(path.dirname(outputPath), { recursive: true });
-  fs.renameSync(temporaryPath, outputPath);
-  process.stdout.write(JSON.stringify({ path: outputPath, frames: encoded.pages, width: encoded.width, height: encoded.pageHeight, durationMs: encodedDuration }));
+  let chosen, chosenMetadata, chosenSize, chosenColours;
+  for (const colours of [192, 128, 96, 64, 48, 32]) {
+    const temporaryPath = `${outputPath}.tmp-${colours}.gif`;
+    fs.rmSync(temporaryPath, { force: true });
+    await sharp({
+      create: {
+        width: metadata.width,
+        height: metadata.height * frames.length,
+        channels: 4,
+        background: { r: 0, g: 0, b: 0, alpha: 0 },
+        pageHeight: metadata.height,
+      },
+    }).composite(inputs.map((input, index) => ({ input, left: 0, top: metadata.height * index })))
+      .gif({ loop: 0, delay: delays, effort: 10, colours, dither: 0 })
+      .toFile(temporaryPath);
+
+    const encoded = await sharp(temporaryPath).metadata();
+    if (encoded.pages !== frames.length || encoded.delay?.length !== frames.length) {
+      fs.rmSync(temporaryPath, { force: true });
+      throw new Error(`GIF encoding incomplete: expected ${frames.length} pages, found ${encoded.pages || 0}.`);
+    }
+    const encodedDuration = encoded.delay.reduce((sum, delay) => sum + delay, 0);
+    if (encodedDuration !== durationCs * 10) {
+      fs.rmSync(temporaryPath, { force: true });
+      throw new Error(`GIF duration mismatch: expected ${durationCs * 10} ms, encoded ${encodedDuration} ms.`);
+    }
+    chosen = temporaryPath;
+    chosenMetadata = encoded;
+    chosenSize = fs.statSync(temporaryPath).size;
+    chosenColours = colours;
+    if (chosenSize <= targetBytes) break;
+  }
+  fs.renameSync(chosen, outputPath);
+  for (const colours of [192, 128, 96, 64, 48, 32]) {
+    const temporaryPath = `${outputPath}.tmp-${colours}.gif`;
+    if (temporaryPath !== chosen) fs.rmSync(temporaryPath, { force: true });
+  }
+  process.stdout.write(JSON.stringify({ path: outputPath, frames: chosenMetadata.pages, width: chosenMetadata.width, height: chosenMetadata.pageHeight, durationMs: chosenMetadata.delay.reduce((sum, delay) => sum + delay, 0), sizeBytes: chosenSize, colours: chosenColours }));
 }
 
 main().catch(error => { process.stderr.write(`${error.stack || error}\n`); process.exitCode = 1; });

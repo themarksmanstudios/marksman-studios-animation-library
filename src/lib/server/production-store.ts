@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import type { Animation } from '@/types/animation';
-import type { ProductionProject } from '@/types/production';
+import type { ProductionAction, ProductionProject } from '@/types/production';
 import { MIXAMO_BONES, mixamoSourceName } from '@/lib/retarget/mixamo-bones';
 import { HttpError } from './http';
 
@@ -92,6 +92,20 @@ function projectFile(directory: string) {
   return path.join(directory, 'project.json');
 }
 
+function completedProductionActions(project: ProductionProject): ProductionAction[] {
+  const completed = new Set<ProductionAction>(project.completedActions || []);
+  if (project.lastFailedAction) completed.delete(project.lastFailedAction);
+  const basename = safeFolderName(project.title);
+  const product = path.join(project.directory, '09-final-product');
+  if (project.lastFailedAction !== 'glb' && fs.existsSync(path.join(product, 'glb', `${basename}_playback.glb`))) completed.add('glb');
+  if (project.lastFailedAction !== 'gif' && fs.existsSync(path.join(product, 'gif', `${basename}_preview.gif`))) completed.add('gif');
+  if (project.lastFailedAction !== 'fbx' && ['mixamo', 'unreal-engine', 'general-animations'].some(folder => {
+    try { return fs.readdirSync(path.join(product, folder)).some(file => file.toLowerCase().endsWith('.fbx')); }
+    catch { return false; }
+  })) completed.add('fbx');
+  return (['glb', 'gif', 'fbx'] as ProductionAction[]).filter(action => completed.has(action));
+}
+
 function writeProject(project: ProductionProject) {
   const directory = path.dirname(projectFile(project.directory));
   fs.mkdirSync(directory, { recursive: true });
@@ -102,7 +116,9 @@ function writeProject(project: ProductionProject) {
 
 export function readProductionProject(id: string): ProductionProject | null {
   const directory = locateProjectDirectory(id);
-  return directory ? JSON.parse(fs.readFileSync(projectFile(directory), 'utf8')) as ProductionProject : null;
+  if (!directory) return null;
+  const project = JSON.parse(fs.readFileSync(projectFile(directory), 'utf8')) as ProductionProject;
+  return { ...project, completedActions: completedProductionActions(project) };
 }
 
 export function listCompletedProductionPreviews(): Record<string, string> {
@@ -201,17 +217,23 @@ export function createProductionProject(animation: Animation): ProductionProject
   const paths: Record<string, string> = {
     captureVideo: path.join(directory, '01-capture-video'),
     motionSource: path.join(directory, '02-motion-source'),
+    motionSourceOutput: path.join(directory, '02-motion-source', 'rig-output'),
     blenderProject: path.join(directory, '04-blender-project'),
     blendFile: path.join(directory, '04-blender-project', `${safeFolderName(animation.title)}.blend`),
     renderFrames: path.join(directory, '05-preview', 'render-frames'),
-    preview: path.join(directory, '05-preview', 'gif'),
-    glb: path.join(directory, '06-exports', 'glb'),
+    finalProduct: path.join(directory, '09-final-product'),
+    finalMotionSourceOutput: path.join(directory, '09-final-product', 'general-animations'),
+    preview: path.join(directory, '09-final-product', 'gif'),
+    glb: path.join(directory, '09-final-product', 'glb'),
     unrealRig: path.join(directory, '07-rig-exports', 'unreal', 'rig-input'),
-    unrealExport: path.join(directory, '07-rig-exports', 'unreal', 'output'),
+    unrealSanitized: path.join(directory, '07-rig-exports', 'unreal', 'rig-output'),
+    unrealSanitizedFinal: path.join(directory, '09-final-product', 'unreal-engine'),
     mixamoRig: path.join(directory, '07-rig-exports', 'mixamo', 'rig-input'),
-    mixamoExport: path.join(directory, '07-rig-exports', 'mixamo', 'output'),
+    mixamoSanitized: path.join(directory, '07-rig-exports', 'mixamo', 'rig-output'),
+    mixamoSanitizedFinal: path.join(directory, '09-final-product', 'mixamo'),
     generalRig: path.join(directory, '07-rig-exports', 'general', 'rig-input'),
-    generalExport: path.join(directory, '07-rig-exports', 'general', 'output'),
+    generalSanitized: path.join(directory, '07-rig-exports', 'general', 'rig-output'),
+    generalSanitizedFinal: path.join(directory, '09-final-product', 'general-animations'),
     logs: path.join(directory, '08-logs'),
   };
   Object.entries(paths).filter(([key]) => key !== 'blendFile').forEach(([, folder]) => fs.mkdirSync(folder, { recursive: true }));
@@ -223,10 +245,10 @@ export function createProductionProject(animation: Animation): ProductionProject
     fs.writeFileSync(path.join(paths[`${rig.key}Rig`], 'README.txt'), [
       `${rig.label} animated rig input`,
       'Copy an animated .blend, .fbx, .bvh, .glb or .gltf file into this folder.',
-      'This rig animation is retargeted onto the character in the uploaded Blender scene and exported as a GLB with baked animation.',
+      'A source-animation FBX is exported under rig-output and 09-final-product under the matching rig-type folder after removing the head mesh. The source armature, body mesh, and original animation are preserved; the head bone is not removed.',
       rig.key === 'mixamo' ? 'Mixamo uses the shared bone map configured from Add bone names on the dashboard; a local retarget-map.json is used only when no shared map has been saved.' : 'For different source/character bone names, add retarget-map.json with source-bone to scene-character-bone pairs.',
       'Example: {"mixamorig:Hips":"pelvis", "mixamorig:Spine":"spine_01"}',
-      'The Blender worker bakes mapped pose constraints across the source action frame range.',
+      'The Blender worker also bakes retargeted motion onto the approved scene character for the separate playback GLB used in the 3D viewport.',
     ].join('\n'), 'utf8');
   }
 
@@ -238,6 +260,10 @@ export function createProductionProject(animation: Animation): ProductionProject
     createdAt: existing?.createdAt || now,
     updatedAt: now,
     outputs: sameFolder ? existing?.outputs || [] : [],
+    gifResolution: sameFolder ? existing?.gifResolution : undefined,
+    completedActions: sameFolder ? existing?.completedActions || [] : [],
+    lastFailedAction: sameFolder ? existing?.lastFailedAction : null,
+    currentAction: null,
   };
   const manifest = {
     version: 1,
@@ -254,7 +280,7 @@ export function createProductionProject(animation: Animation): ProductionProject
     paths,
     templateFile: getProductionSettings().templateFile || null,
     hdriFile: getProductionSettings().hdriFile || null,
-    targets: RIGS.map(rig => ({ key: rig.key, label: rig.label, inputDirectory: paths[`${rig.key === 'general' ? 'general' : rig.key}Rig`], outputDirectory: paths[`${rig.key === 'general' ? 'general' : rig.key}Export`] })),
+    targets: RIGS.map(rig => ({ key: rig.key, label: rig.label, inputDirectory: paths[`${rig.key}Rig`], sourceOutputDirectory: paths[`${rig.key}Sanitized`], finalSourceOutputDirectory: paths[`${rig.key}SanitizedFinal`] })),
     delivery: { preview: 'GIF', playback: 'GLB', destination: 'Box API (not configured)' },
     updatedAt: now,
   };
@@ -266,11 +292,11 @@ export function createProductionProject(animation: Animation): ProductionProject
     `1. Copy raw capture videos into: ${paths.captureVideo}`,
     `2. Copy tracked motion data (FBX, BVH, GLB or GLTF) into: ${paths.motionSource}`,
     '3. The approved mascot/character should already be present in the uploaded Blender scene template.',
-    '4. Put each rig-specific animated file into its matching rig-input folder under 07-rig-exports.',
+    '4. Put each rig-specific animated file into its matching rig-input folder under 07-rig-exports. A source-animation FBX without the head mesh is written to its matching rig-output folder and to 09-final-product under Mixamo, Unreal Engine, or General; input files are preserved.',
     '5. Configure shared Mixamo source-to-character bone names with Add bone names in the dashboard. Other rigs can use a retarget-map.json in their rig-input folder.',
-    '6. Use Prepare Blender Job in the dashboard after configuring BLENDER_EXECUTABLE.',
+    '6. Run the ordered production actions: Create playback GLB, then Create GIF, then Create head-removed FBXs. Each action unlocks after its predecessor succeeds.',
     '',
-    'Rendering creates PNG frames first, then a GIF preview. GLB is the playback export.',
+    'Final portal assets are grouped under 09-final-product: GIF preview, playback GLB, and the original-animation FBXs without head meshes under mixamo/, unreal-engine/, and general-animations/. The FBXs are also copied into each 07-rig-exports/{rig}/rig-output folder; they are not retargeted onto the studio character. Only the shared playback GLB is exported; there are no per-rig GLBs.',
     'A separate character asset is not required when the uploaded Blender scene contains the approved character.',
     'Optional rig retargeting and Box delivery require rig assets and API configuration.',
   ].join('\n'), 'utf8');
@@ -278,10 +304,13 @@ export function createProductionProject(animation: Animation): ProductionProject
   return project;
 }
 
-export function enqueueBlenderJob(id: string): ProductionProject {
+export function enqueueBlenderJob(id: string, action: ProductionAction, resolution?: { width: number; height: number }): ProductionProject {
   const project = readProductionProject(id);
   if (!project) throw new HttpError(409, 'Create the Blender production workspace first.');
   if (project.status === 'queued' || project.status === 'running') throw new HttpError(409, 'A Blender job is already in progress.');
+  const completed = new Set(project.completedActions || []);
+  if (action === 'gif' && !completed.has('glb')) throw new HttpError(409, 'Create the playback GLB successfully before rendering the GIF.');
+  if (action === 'fbx' && (!completed.has('glb') || !completed.has('gif'))) throw new HttpError(409, 'Create the playback GLB and GIF successfully before exporting head-removed FBXs.');
   const executable = process.env.BLENDER_EXECUTABLE;
   if (!executable) throw new HttpError(503, 'Blender is not configured. Set BLENDER_EXECUTABLE in .env.local, then restart the app.');
   if (!fs.existsSync(executable)) throw new HttpError(503, 'The configured Blender executable was not found. Check BLENDER_EXECUTABLE.');
@@ -290,6 +319,8 @@ export function enqueueBlenderJob(id: string): ProductionProject {
   manifestData.templateFile = getProductionSettings().templateFile || null;
   manifestData.hdriFile = getProductionSettings().hdriFile || null;
   manifestData.mixamoRetargetMapFile = getMixamoRetargetMapPath();
+  manifestData.jobAction = action;
+  manifestData.renderSettings = { ...((manifestData.renderSettings as Record<string, unknown> | undefined) || {}), ...(resolution ? { gifWidth: resolution.width, gifHeight: resolution.height } : {}) };
   const manifestPaths = manifestData.paths as Record<string, string> | undefined;
   const blendFile = manifestPaths?.blendFile;
   if (blendFile && fs.existsSync(blendFile) && fs.statSync(blendFile).isDirectory()) {
@@ -300,7 +331,7 @@ export function enqueueBlenderJob(id: string): ProductionProject {
   const worker = path.join(PIPELINE, 'process_animation.py');
   if (!fs.existsSync(worker)) throw new HttpError(503, 'The Blender worker script is missing from integrations/blender.');
 
-  const next = { ...project, status: 'queued' as const, updatedAt: new Date().toISOString(), lastError: undefined };
+  const next = { ...project, ...(resolution ? { gifResolution: resolution } : {}), currentAction: action, status: 'queued' as const, updatedAt: new Date().toISOString(), lastError: undefined };
   writeProject(next);
   try {
     const child = spawn(executable, ['--background', '--python', worker, '--', manifest], {
@@ -309,11 +340,11 @@ export function enqueueBlenderJob(id: string): ProductionProject {
     });
     child.once('error', error => {
       const failed = readProductionProject(id);
-      if (failed) writeProject({ ...failed, status: 'failed', updatedAt: new Date().toISOString(), lastError: error.message });
+      if (failed) writeProject({ ...failed, status: 'failed', currentAction: null, lastFailedAction: action, updatedAt: new Date().toISOString(), lastError: error.message });
     });
     child.unref();
   } catch (error) {
-    const failed = { ...next, status: 'failed' as const, updatedAt: new Date().toISOString(), lastError: error instanceof Error ? error.message : String(error) };
+    const failed = { ...next, status: 'failed' as const, currentAction: null, lastFailedAction: action, updatedAt: new Date().toISOString(), lastError: error instanceof Error ? error.message : String(error) };
     writeProject(failed);
     throw new HttpError(500, 'Could not start Blender. Check the local server log.');
   }

@@ -2,6 +2,7 @@
 import json
 import os
 import re
+import shutil
 import struct
 import subprocess
 import sys
@@ -63,14 +64,161 @@ def import_asset(file_path):
         raise RuntimeError("Unsupported Blender input: " + str(file_path))
 
 
-def import_motion_inputs(manifest):
+def is_source_head_mesh(obj):
+    if obj.type != "MESH":
+        return False
+    for value in (obj.name, obj.data.name if obj.data else ""):
+        name = re.sub(r"\.\d+$", "", value).lower()
+        compact = re.sub(r"[^a-z0-9]", "", name)
+        if re.search(r"(^|[^a-z0-9])head[a-z0-9]*(?=$|[^a-z0-9])", name):
+            return True
+        if re.search(r"head(?:face|mesh|geo|lod\d*)?$", compact):
+            return True
+    return False
+
+
+def strip_source_head_meshes(objects):
+    """Remove separately named head mesh objects, never armature head bones."""
+    live_objects = [obj for obj in objects if obj.name in bpy.data.objects]
+    heads = [obj for obj in live_objects if is_source_head_mesh(obj)]
+    head_pointers = {obj.as_pointer() for obj in heads}
+    remaining = [obj for obj in live_objects if obj.as_pointer() not in head_pointers]
+    for obj in heads:
+        bpy.data.objects.remove(obj, do_unlink=True)
+    return remaining
+
+
+def hide_imported_rig_from_render(scene, original_objects):
+    """Keep the source body/rig available in the scene, but out of renders."""
+    for obj in scene.objects:
+        if obj not in original_objects:
+            obj.hide_render = True
+
+
+def sanitize_blend_source(source, output):
+    script = Path(__file__).with_name("sanitize_blend.py")
+    output = Path(output)
+    output.unlink(missing_ok=True)
+    result = subprocess.run(
+        [bpy.app.binary_path, "--background", str(source), "--python", str(script), "--", str(output)],
+        capture_output=True, text=True, timeout=1800,
+    )
+    if result.returncode or not output.is_file() or output.stat().st_size == 0:
+        raise RuntimeError("Could not create headless Blender source copy: " + (result.stderr or result.stdout)[-3000:])
+
+
+def rig_related_objects(imported_objects):
+    armatures = [obj for obj in imported_objects if obj.type == "ARMATURE"]
+    if not armatures:
+        return imported_objects
+    selected = set(armatures)
+    for obj in imported_objects:
+        if obj.type != "MESH":
+            continue
+        if obj.parent in armatures or obj.parent_type == "BONE" or any(
+            modifier.type == "ARMATURE" and modifier.object in armatures for modifier in obj.modifiers
+        ):
+            selected.add(obj)
+    for obj in list(selected):
+        parent = obj.parent
+        while parent and parent in imported_objects:
+            selected.add(parent)
+            parent = parent.parent
+    return [obj for obj in imported_objects if obj in selected]
+
+
+def set_source_export_action(armature, scene):
+    """Put the source animation on a dedicated NLA strip so FBX writes a take."""
+    action = action_for_rig(armature)
+    if not action or not action_curve_count(action):
+        return None
+    animation = armature.animation_data_create()
+    slot = getattr(animation, "action_slot", None)
+    action_slots = list(getattr(action, "slots", ()))
+    if action_slots and slot not in action_slots:
+        slot = action_slots[0]
+    animation.action = action
+    if slot and hasattr(animation, "action_slot"):
+        animation.action_slot = slot
+    track = animation.nla_tracks.new()
+    track.name = "Source FBX Export"
+    track.is_solo = True
+    start = int(action.frame_range[0])
+    strip = track.strips.new(action.name, start, action)
+    if slot and hasattr(strip, "action_slot"):
+        strip.action_slot = slot
+    animation.action = None
+    scene.frame_start = int(action.frame_range[0])
+    scene.frame_end = max(int(action.frame_range[1]), scene.frame_start + 1)
+    scene.frame_set(scene.frame_start)
+    bpy.context.view_layer.update()
+    return action
+
+
+def export_sanitized_source(asset, imported_objects, output_directory, final_output_directory=None):
+    """Export source armature/action as FBX after removing only its head mesh."""
+    output_directory = Path(output_directory)
+    output_directory.mkdir(parents=True, exist_ok=True)
+    output = output_directory / (asset.stem + ".fbx")
+    if asset.suffix.lower() == ".blend":
+        strip_source_head_meshes(imported_objects)
+        sanitize_blend_source(asset, output)
+    else:
+        cleaned_objects = strip_source_head_meshes(imported_objects)
+        for obj in bpy.context.scene.objects:
+            obj.select_set(False)
+        exportable = rig_related_objects(cleaned_objects)
+        if not exportable:
+            raise RuntimeError("Could not export source animation as FBX because the input did not import any objects: " + str(asset))
+        output.unlink(missing_ok=True)
+        for obj in exportable:
+            obj.select_set(True)
+        armatures = [obj for obj in exportable if obj.type == "ARMATURE"]
+        if not armatures:
+            raise RuntimeError("Could not export source animation as FBX because the input has no armature: " + str(asset))
+        bpy.context.view_layer.objects.active = armatures[0]
+        actions = [set_source_export_action(armature, bpy.context.scene) for armature in armatures]
+        if not any(actions):
+            raise RuntimeError("Could not export source animation as FBX because no animated action was assigned: " + str(asset))
+        bpy.ops.export_scene.fbx(
+            filepath=str(output), use_selection=True, object_types={"ARMATURE", "MESH", "EMPTY"},
+            add_leaf_bones=False, use_armature_deform_only=False, bake_anim=True,
+            bake_anim_use_nla_strips=True, bake_anim_use_all_bones=True,
+        )
+        for obj in bpy.context.scene.objects:
+            obj.select_set(False)
+    final_copy = None
+    if final_output_directory:
+        final_directory = Path(final_output_directory)
+        final_directory.mkdir(parents=True, exist_ok=True)
+        final_copy = final_directory / output.name
+        if final_copy.resolve() != output.resolve():
+            shutil.copy2(output, final_copy)
+    return output, final_copy
+
+
+def import_motion_inputs(manifest, export_sanitized=True):
     paths = manifest["paths"]
     motion_files = files_in(paths["motionSource"], SUPPORTED)
     imported = []
+    sanitized_outputs = []
     prior_objects = set(bpy.context.scene.objects)
     prior_actions = set(bpy.data.actions)
     for asset in motion_files:
+        before_asset_objects = set(bpy.context.scene.objects)
         import_asset(asset)
+        asset_objects = [obj for obj in bpy.context.scene.objects if obj not in before_asset_objects]
+        if export_sanitized:
+            final_root = Path(paths.get("finalProduct", Path(paths["motionSource"]).parent / "09-final-product"))
+            final_source_output = str(final_root / "general-animations")
+            sanitized, final_copy = export_sanitized_source(
+                asset, asset_objects,
+                paths.get("motionSourceOutput", str(Path(paths["motionSource"]) / "rig-output")),
+                final_source_output,
+            )
+            sanitized_outputs.append(str(sanitized))
+            if final_copy:
+                sanitized_outputs.append(str(final_copy))
         imported.append(str(asset))
     armatures = [obj for obj in bpy.context.scene.objects if obj.type == "ARMATURE" and obj not in prior_objects]
     actions = [action for action in bpy.data.actions if action not in prior_actions]
@@ -83,7 +231,7 @@ def import_motion_inputs(manifest):
             if not (rig.animation_data and rig.animation_data.action):
                 rig.animation_data_create()
                 rig.animation_data.action = source_action
-    return imported, armatures, source_action
+    return imported, armatures, source_action, sanitized_outputs
 
 
 def choose_character_rig(objects):
@@ -638,7 +786,7 @@ def retarget_to_rig(source_rig, target_rig, map_file, scene):
     return bool(action_fcurves(action))
 
 
-def export_rig_variants(manifest, render_gif=False):
+def export_rig_variants(manifest, render_gif=False, export_playback_glb=True, export_source_fbx=False):
     missing = []
     produced = []
     template = manifest.get("templateFile")
@@ -670,7 +818,17 @@ def export_rig_variants(manifest, render_gif=False):
         before_objects = set(scene.objects)
         before_actions = set(bpy.data.actions)
         for asset in rig_files:
+            before_asset_objects = set(scene.objects)
             import_asset(asset)
+            asset_objects = [obj for obj in scene.objects if obj not in before_asset_objects]
+            if export_source_fbx:
+                input_directory = Path(target["inputDirectory"]).resolve()
+                source_output_directory = target.get("sourceOutputDirectory", str(input_directory.parent / "rig-output"))
+                final_source_output = target.get("finalSourceOutputDirectory") or str(Path(manifest["paths"].get("finalProduct", input_directory.parents[2] / "09-final-product")) / ("general-animations" if target.get("key") == "general" else input_directory.parent.name))
+                sanitized, final_copy = export_sanitized_source(asset, asset_objects, source_output_directory, final_source_output)
+                produced.append(str(sanitized))
+                if final_copy:
+                    produced.append(str(final_copy))
         source_armatures = [obj for obj in scene.objects if obj.type == "ARMATURE" and obj not in before_objects]
         new_actions = [action for action in bpy.data.actions if action not in before_actions]
         source_action = max(new_actions, key=action_curve_count, default=None)
@@ -690,17 +848,9 @@ def export_rig_variants(manifest, render_gif=False):
         if not retarget_to_rig(source_rig, character_rig, map_file, scene):
             missing.append(target["label"] + " retarget failed; add retarget-map.json if rig bone names differ from the scene character")
             continue
-        # Retarget input FBX files can include a source mannequin/mesh. It is
-        # useful for evaluation but must not appear as a second character in
-        # the scene render or GIF.
-        for imported_object in scene.objects:
-            if imported_object.type == "ARMATURE" and imported_object != character_rig:
-                imported_object.hide_render = True
-                for child in scene.objects:
-                    if child.type == "MESH" and any(mod.type == "ARMATURE" and mod.object == imported_object for mod in child.modifiers):
-                        child.hide_render = True
-            if imported_object not in before_objects:
-                imported_object.hide_render = True
+        # Keep the source body and rig in the saved working scene, but hide
+        # them from renders; the approved scene character is the render target.
+        hide_imported_rig_from_render(scene, before_objects)
         subjects = character_export_objects(template_objects, character_rig, [])
         if not subjects:
             missing.append(target["label"] + " scene character mesh for GLB export")
@@ -710,20 +860,15 @@ def export_rig_variants(manifest, render_gif=False):
             if gif:
                 produced.append(gif)
                 gif_done = True
-            # The canonical playback download must use this same baked
-            # character action that produced the GIF preview frames.
+            if warning:
+                missing.append(warning)
+        if export_playback_glb:
+            # The canonical playback download uses this retargeted character.
             playback_name = Path(manifest["paths"].get("blendFile", manifest["animation"]["title"] + ".blend")).stem + "_playback"
             playback = export_glb(subjects, manifest["paths"]["glb"], playback_name)
             if playback:
                 produced.append(str(playback))
-            if warning:
-                missing.append(warning)
-        for obj in scene.objects:
-            obj.select_set(False)
-        output = export_glb(subjects, target["outputDirectory"], Path(manifest["paths"].get("blendFile", manifest["animation"]["title"] + ".blend")).stem + "_" + target["key"])
-        if output:
-            produced.append(str(output))
-        if render_gif and not blend_saved:
+        if (render_gif or export_playback_glb) and not blend_saved:
             blend_path = Path(manifest["paths"]["blendFile"])
             blend_path.parent.mkdir(parents=True, exist_ok=True)
             bpy.ops.wm.save_as_mainfile(filepath=str(blend_path))
@@ -731,13 +876,53 @@ def export_rig_variants(manifest, render_gif=False):
     return produced, missing, gif_done
 
 
+def export_source_animation_files(manifest):
+    """Export each source rig animation to its own head-removed FBX outputs."""
+    produced, missing = [], []
+    paths = manifest["paths"]
+    jobs = []
+    for target in manifest.get("targets", []):
+        input_directory = Path(target["inputDirectory"]).resolve()
+        source_output = target.get("sourceOutputDirectory", str(input_directory.parent / "rig-output"))
+        final_output = target.get("finalSourceOutputDirectory")
+        if not final_output:
+            final_root = Path(paths.get("finalProduct", input_directory.parents[2] / "09-final-product"))
+            final_folder = "general-animations" if target.get("key") == "general" else input_directory.parent.name
+            final_output = str(final_root / final_folder)
+        assets = files_in(input_directory, SUPPORTED)
+        if not assets:
+            missing.append(target.get("label", target.get("key", "Rig")) + " animation/rig file in its rig-input folder")
+        jobs.extend((asset, source_output, final_output) for asset in assets)
+
+    motion_directory = Path(paths["motionSource"]).resolve()
+    motion_assets = files_in(motion_directory, SUPPORTED)
+    if motion_assets:
+        final_root = Path(paths.get("finalProduct", motion_directory.parent / "09-final-product"))
+        jobs.extend((asset, paths.get("motionSourceOutput", str(motion_directory / "rig-output")), str(final_root / "general-animations")) for asset in motion_assets)
+
+    for asset, source_output, final_output in jobs:
+        bpy.ops.wm.read_factory_settings(use_empty=True)
+        before_objects = set(bpy.context.scene.objects)
+        import_asset(asset)
+        imported_objects = [obj for obj in bpy.context.scene.objects if obj not in before_objects]
+        sanitized, final_copy = export_sanitized_source(asset, imported_objects, source_output, final_output)
+        produced.append(str(sanitized))
+        if final_copy:
+            produced.append(str(final_copy))
+    if not jobs:
+        missing.append("No source animation files were found in the rig-input or 02-motion-source folders.")
+    return produced, missing
+
+
 def render_preview(manifest, scene):
     frames_folder = Path(manifest["paths"]["renderFrames"])
     gif_folder = Path(manifest["paths"]["preview"])
     frames_folder.mkdir(parents=True, exist_ok=True)
-    width = max(240, min(int(os.environ.get("BLENDER_PREVIEW_RESOLUTION", "480")), 480))
+    render_settings = manifest.get("renderSettings", {})
+    width = max(120, min(int(render_settings.get("gifWidth", os.environ.get("BLENDER_PREVIEW_RESOLUTION", "480"))), 1920))
+    height = max(120, min(int(render_settings.get("gifHeight", width)), 1920))
     scene.render.resolution_x = width
-    scene.render.resolution_y = width
+    scene.render.resolution_y = height
     scene.render.resolution_percentage = 100
     scene.render.image_settings.file_format = "PNG"
     scene.render.image_settings.color_mode = "RGB"
@@ -769,8 +954,12 @@ def render_preview(manifest, scene):
     encoder = Path(__file__).with_name("encode_gif.cjs")
     node = os.environ.get("NODE_EXECUTABLE", "node")
     try:
-        subprocess.run([node, str(encoder), str(frames_folder), str(output), str(total), str(preview_fps), str(round(source_duration * 1000))], check=True, capture_output=True, text=True, timeout=1800)
-        return str(output), None
+        encoded = subprocess.run([node, str(encoder), str(frames_folder), str(output), str(total), str(preview_fps), str(round(source_duration * 1000)), "5242880"], check=True, capture_output=True, text=True, timeout=1800)
+        result = json.loads(encoded.stdout)
+        warning = None
+        if result.get("sizeBytes", 0) > 5 * 1024 * 1024:
+            warning = "GIF is %.1f MB at %d×%d; palette reduction could not reach the 5 MB target at the selected resolution." % (result["sizeBytes"] / (1024 * 1024), result.get("width", width), result.get("height", height))
+        return str(output), warning
     except Exception as error:
         details = getattr(error, "stderr", "") or str(error)
         return None, "PNG frames rendered; GIF conversion failed. Verify sharp is installed with npm install: " + details[-1200:]
@@ -800,19 +989,43 @@ def run(manifest_path):
     manifest = load_json(manifest_path)
     project_path = manifest_path.parent / "project.json"
     project = load_json(project_path)
-    project.update(status="running", updatedAt=__import__("datetime").datetime.now().astimezone().isoformat(), lastError=None, sourceFiles=manifest_source_files(manifest))
+    job_action = manifest.get("jobAction", "all")
+    project.update(status="running", updatedAt=__import__("datetime").datetime.now().astimezone().isoformat(), currentAction=job_action if job_action in {"glb", "gif", "fbx"} else None, lastError=None, sourceFiles=manifest_source_files(manifest))
     save_json(project_path, project)
+    previous_outputs = list(project.get("outputs", []))
     outputs, missing = [], []
     try:
-        preview_path = Path(manifest["paths"]["preview"]) / (Path(manifest["paths"].get("blendFile", manifest["animation"]["title"] + ".blend")).stem + "_preview.gif")
-        playback_path = Path(manifest["paths"]["glb"]) / (Path(manifest["paths"].get("blendFile", manifest["animation"]["title"] + ".blend")).stem + "_playback.glb")
-        # A previous static or stale preview must not remain visible when this
-        # run has no successfully baked retargeted animation to render.
-        preview_path.unlink(missing_ok=True)
-        # Likewise, don't leave an old base-scene GLB where users expect the
-        # current retargeted playback asset.
-        playback_path.unlink(missing_ok=True)
+        if job_action == "fbx":
+            outputs, missing = export_source_animation_files(manifest)
+            status = "complete" if outputs and not missing else "partial" if outputs else "failed"
+            completed = set(project.get("completedActions", []))
+            if any(Path(output).suffix.lower() == ".fbx" and Path(output).is_file() for output in outputs):
+                completed.add("fbx")
+            last_failed = project.get("lastFailedAction")
+            project.update(status=status, currentAction=None, lastFailedAction=None if last_failed == job_action else last_failed, completedActions=sorted(completed), updatedAt=__import__("datetime").datetime.now().astimezone().isoformat(), outputs=list(dict.fromkeys(outputs + previous_outputs)), missingInputs=missing)
+            save_json(project_path, project)
+            return
+        # Keep the last successful preview/playback files until replacements
+        # are produced. Failed jobs must not erase the current deliverables.
+        basename = Path(manifest["paths"].get("blendFile", manifest["animation"]["title"] + ".blend")).stem
         template = manifest.get("templateFile")
+        final_root = Path(manifest["paths"].get("finalProduct", manifest_path.parent / "09-final-product"))
+        legacy_variant_folders = {
+            "mixamo": ("mixamo",),
+            "unreal": ("unreal-engine",),
+            "general": ("general-animations", "general", "generic"),
+        }
+        for target in manifest.get("targets", []):
+            key = target.get("key", "").lower()
+            basename_variant = basename + "_" + key + ".glb"
+            input_parent = Path(target["inputDirectory"]).parent
+            obsolete_paths = [input_parent / "output" / basename_variant, final_root / "glb" / basename_variant]
+            obsolete_paths.extend(final_root / folder / basename_variant for folder in legacy_variant_folders.get(key, ()))
+            configured_output = target.get("outputDirectory")
+            if configured_output:
+                obsolete_paths.append(Path(configured_output) / basename_variant)
+            for obsolete in {path.resolve() for path in obsolete_paths}:
+                obsolete.unlink(missing_ok=True)
         if template and Path(template).is_file():
             bpy.ops.wm.open_mainfile(filepath=str(template))
         scene = bpy.context.scene
@@ -825,7 +1038,9 @@ def run(manifest_path):
                 missing.append("Configured HDRI file is missing: " + str(hdri))
         template_objects = set(scene.objects)
         character_rig = choose_character_rig(template_objects)
-        imported, motion_armatures, motion_action = import_motion_inputs(manifest)
+        import_motion_sources = job_action == "all"
+        imported, motion_armatures, motion_action, sanitized_motion_outputs = import_motion_inputs(manifest, export_sanitized=import_motion_sources)
+        outputs.extend(sanitized_motion_outputs)
         character_baked = False
         if character_rig and motion_action:
             scene.frame_start = round(motion_action.frame_range[0])
@@ -841,6 +1056,7 @@ def run(manifest_path):
                     missing.append("The scene character could not be retargeted. Add 02-motion-source/retarget-map.json if the source and character bone names differ.")
                 else:
                     character_baked = True
+        hide_imported_rig_from_render(scene, template_objects)
         active_action = action_for_rig(character_rig) if character_rig else None
         if not active_action:
             active_action = motion_action
@@ -849,9 +1065,9 @@ def run(manifest_path):
         has_rig_animation = any(files_in(target["inputDirectory"], SUPPORTED) for target in manifest.get("targets", []))
         if not motion_action and not active_action and not has_rig_animation:
             missing.append("No motion action found in the scene or 02-motion-source.")
-        subjects = character_export_objects(template_objects, character_rig, motion_armatures)
-        if not subjects:
-            subjects = [obj for obj in scene.objects if obj.type in {"MESH", "ARMATURE"}]
+        # Product exports must come from the approved character in the scene
+        # template. Never fall back to the imported source rig or its meshes.
+        subjects = character_export_objects(template_objects, character_rig, [])
         if subjects:
             ensure_camera_and_light(scene)
             tune_preview_lighting(scene)
@@ -860,31 +1076,44 @@ def run(manifest_path):
             scene.render.resolution_percentage = 100
             scene.frame_start = round(active_action.frame_range[0]) if active_action else 1
             scene.frame_end = round(active_action.frame_range[1]) if active_action else 24
-            basename = Path(manifest["paths"].get("blendFile", manifest["animation"]["title"] + ".blend")).stem
-            if character_baked:
+            if character_baked and job_action in {"glb", "all"}:
                 glb = export_glb(subjects, manifest["paths"]["glb"], basename + "_playback")
                 if glb:
                     outputs.append(str(glb))
             blend_path = Path(manifest["paths"].get("blendFile", Path(manifest["paths"]["blenderProject"]) / (manifest["animation"]["id"] + ".blend")))
             bpy.ops.wm.save_as_mainfile(filepath=str(blend_path))
             outputs.append(str(blend_path))
-            if character_baked:
+            if character_baked and job_action in {"gif", "all"}:
                 gif, warning = render_preview(manifest, scene)
                 if gif:
                     outputs.append(gif)
                 if warning:
                     missing.append(warning)
-            rig_outputs, rig_missing, rig_gif_done = export_rig_variants(manifest, render_gif=not character_baked)
-            outputs.extend(rig_outputs)
-            missing.extend(rig_missing)
+            if not character_baked and job_action in {"gif", "glb", "all"}:
+                rig_outputs, rig_missing, rig_gif_done = export_rig_variants(
+                    manifest,
+                    render_gif=job_action in {"gif", "all"},
+                    export_playback_glb=job_action in {"glb", "all"},
+                    export_source_fbx=False,
+                )
+                outputs.extend(rig_outputs)
+                missing.extend(rig_missing)
         video_files = files_in(manifest["paths"]["captureVideo"], VIDEO)
         if not video_files:
             missing.append("raw capture video (optional; place it in 01-capture-video)")
         status = "complete" if outputs and not missing else "partial" if outputs else "failed"
-        project.update(status=status, updatedAt=__import__("datetime").datetime.now().astimezone().isoformat(), outputs=outputs, missingInputs=missing)
+        completed = set(project.get("completedActions", []))
+        for action, extension in (("glb", ".glb"), ("gif", ".gif"), ("fbx", ".fbx")):
+            if job_action in {action, "all"} and any(Path(output).suffix.lower() == extension and Path(output).is_file() for output in outputs):
+                completed.add(action)
+        last_failed = project.get("lastFailedAction")
+        project.update(status=status, currentAction=None, lastFailedAction=None if last_failed == job_action else last_failed, completedActions=sorted(completed), updatedAt=__import__("datetime").datetime.now().astimezone().isoformat(), outputs=list(dict.fromkeys(outputs + previous_outputs)), missingInputs=missing)
         save_json(project_path, project)
     except Exception as error:
-        project.update(status="failed", updatedAt=__import__("datetime").datetime.now().astimezone().isoformat(), outputs=outputs, lastError=str(error), missingInputs=missing)
+        completed = set(project.get("completedActions", []))
+        if job_action in {"glb", "gif", "fbx"}:
+            completed.discard(job_action)
+        project.update(status="failed", currentAction=None, lastFailedAction=job_action if job_action in {"glb", "gif", "fbx"} else None, completedActions=sorted(completed), updatedAt=__import__("datetime").datetime.now().astimezone().isoformat(), outputs=outputs or previous_outputs, lastError=str(error), missingInputs=missing)
         save_json(project_path, project)
         log_path = Path(manifest["paths"]["logs"]) / "blender-error.log"
         log_path.write_text(traceback.format_exc(), encoding="utf-8")
